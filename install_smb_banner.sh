@@ -2,7 +2,7 @@
 
 # Autor: Wesley Marques
 # Descrição: Instalar e configurar SAMBA4 para ADDC ou File Server (membro de domínio)
-# Versão: 0.6
+# Versão: 0.7
 # Licença: MIT License
 
 # Variáveis configuráveis
@@ -14,7 +14,7 @@ DIR_UNPACK_SAMBA="samba-$SAMBA_VERSION"
 TIMEZONE="America/Sao_Paulo"
 DNS_FORWARDER="8.8.8.8"
 LOG_FILE="/var/log/samba-install.log"
-SCRIPT_VERSION="0.6"
+SCRIPT_VERSION="0.7"
 SAMBA_CONF_DIR="/usr/local/samba/etc"
 SAMBA_CONF="$SAMBA_CONF_DIR/samba/smb.conf"
 
@@ -56,7 +56,7 @@ show_banner() {
     ""
     ""
     "████████╗███████╗ ██████╗██╗  ██╗    ██████╗ ███████╗███╗   ███╗ ██████╗ ████████╗███████╗"
-    "╚══██╔══╝██╔════╝██╔════╝██║  ██║    ██╔══██╗██╔════╝████╗ ████║██╔═══██╗╚══██╔══╝██╔════╝"
+    "╚══██╔══╝██╔════╝██╔════╝██║  ██║    ██╔══██╗██╔════╝████╗ ████║██╔═══██╗╚══██╔══╝██╔====╝"
     "   ██║   █████╗  ██║     ███████║    ██████╔╝████X╗  ██╔████╔██║██║   ██║   ██║   █████╗  "
     "   ██║   ██╔══╝  ██║     ██╔══██║    ██╔══██╗██╔══╝  ██║╚██╔╝██║██║   ██║   ██║   ██╔══╝  "
     "   ██║   ███████╗╚██████╗██║  ██║    ██║  ██║███████╗██║ ╚═╝ ██║╚██████╔╝   ██║   ███████╗"
@@ -358,6 +358,15 @@ provision_addc() {
     }
   fi
 
+  # Remover smb.conf no destino, se existir
+  if [ -f "$SAMBA_CONF" ]; then
+    log "Removendo smb.conf existente em $SAMBA_CONF para evitar conflitos"
+    rm -f "$SAMBA_CONF" || {
+      log "Falha ao remover $SAMBA_CONF"
+      exit 16
+    }
+  fi
+
   log "Configurando ADDC"
   while true; do
     read -p "Informe o FQDN (Ex.: addc01.company.local): " FQDN
@@ -387,16 +396,27 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
 
   echo "$HOSTNAME" >/etc/hostname
 
-  # Criar diretório para smb.conf se não existir
-  mkdir -p "$SAMBA_CONF_DIR/samba"
-
-  # Executar provisionamento com caminho explícito para smb.conf
+  # Executar provisionamento sem especificar --configfile
   log "Executando provisionamento do domínio"
   samba-tool domain provision --use-rfc2307 --domain="$NETBIOS" --realm="$FQDN" \
-    --configfile="$SAMBA_CONF" --dns-backend=SAMBA_INTERNAL || {
+    --dns-backend=SAMBA_INTERNAL || {
     log "Falha no provisionamento"
     exit 9
   }
+
+  # Mover smb.conf gerado para o local desejado
+  GENERATED_CONF="/usr/local/samba/etc/smb.conf"
+  if [ -f "$GENERATED_CONF" ]; then
+    log "Movendo smb.conf gerado para $SAMBA_CONF"
+    mkdir -p "$SAMBA_CONF_DIR/samba"
+    mv "$GENERATED_CONF" "$SAMBA_CONF" || {
+      log "Falha ao mover smb.conf para $SAMBA_CONF"
+      exit 18
+    }
+  else
+    log "Arquivo smb.conf não foi gerado pelo provisionamento"
+    exit 18
+  fi
 
   # Copiar krb5.conf gerado para /etc
   rm -f /etc/krb5.conf
@@ -407,9 +427,9 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
 
   FQDN=${FQDN,,}
 
-  # Gerar smb.conf com configurações adicionais
-  log "Gerando smb.conf em $SAMBA_CONF"
-  echo "
+  # Atualizar smb.conf com configurações adicionais
+  log "Atualizando smb.conf em $SAMBA_CONF"
+  cat >"$SAMBA_CONF" <<EOF
 [global]
     dns forwarder = $DNS_FORWARDER
     netbios name = $NETBIOS
@@ -425,7 +445,11 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
 [sysvol]
     path = /usr/local/samba/var/locks/sysvol
     read only = No
-" >"$SAMBA_CONF"
+EOF
+
+  # Ajustar permissões do diretório
+  chown root:root "$SAMBA_CONF"
+  chmod 644 "$SAMBA_CONF"
 
   systemctl start samba-ad-dc.service || {
     log "Falha ao iniciar o serviço Samba"
@@ -445,6 +469,15 @@ provision_fileserver() {
     log "Removendo smb.conf existente em /etc/samba para evitar conflitos"
     rm -f /etc/samba/smb.conf || {
       log "Falha ao remover /etc/samba/smb.conf"
+      exit 16
+    }
+  fi
+
+  # Remover smb.conf no destino, se existir
+  if [ -f "$SAMBA_CONF" ]; then
+    log "Removendo smb.conf existente em $SAMBA_CONF para evitar conflitos"
+    rm -f "$SAMBA_CONF" || {
+      log "Falha ao remover $SAMBA_CONF"
       exit 16
     }
   fi
@@ -520,7 +553,7 @@ group: compat winbind
 shadow: compat
 " >>/etc/nsswitch.conf
 
-  # Criar diretório para smb.conf se não existir
+  # Criar diretório para smb.conf
   mkdir -p "$SAMBA_CONF_DIR/samba"
 
   # Configurar smb.conf
@@ -551,6 +584,10 @@ shadow: compat
     writable = yes
     valid users = @$DOMAIN_NETBIOS\\Domain\ Users
 " >"$SAMBA_CONF"
+
+  # Ajustar permissões do smb.conf
+  chown root:root "$SAMBA_CONF"
+  chmod 644 "$SAMBA_CONF"
 
   # Criar diretório de compartilhamento
   log "Criando diretório de compartilhamento"
