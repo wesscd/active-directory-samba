@@ -2,7 +2,7 @@
 
 # Autor: Wesley Marques
 # Descrição: Instalar e configurar SAMBA4 para ADDC ou File Server (membro de domínio)
-# Versão: 0.4
+# Versão: 0.6
 # Licença: MIT License
 
 # Variáveis configuráveis
@@ -14,7 +14,9 @@ DIR_UNPACK_SAMBA="samba-$SAMBA_VERSION"
 TIMEZONE="America/Sao_Paulo"
 DNS_FORWARDER="8.8.8.8"
 LOG_FILE="/var/log/samba-install.log"
-SCRIPT_VERSION="0.4"
+SCRIPT_VERSION="0.6"
+SAMBA_CONF_DIR="/usr/local/samba/etc"
+SAMBA_CONF="$SAMBA_CONF_DIR/samba/smb.conf"
 
 # Função para registrar logs
 log() {
@@ -43,7 +45,6 @@ check_os_compatibility() {
 
 # Função para exibir o banner
 show_banner() {
-  # Coletar informações do sistema
   HOSTNAME=$(hostname)
   OS_NAME=$(lsb_release -d | cut -f2-)
   OS_VERSION=$(lsb_release -r | cut -f2)
@@ -78,6 +79,144 @@ show_banner() {
     "Pressione qualquer tecla para continuar..."
 EOF
   read -n 1 -s
+}
+
+# Função para validar endereços IP, máscara, gateway e DNS
+validate_network_input() {
+  local input=$1
+  local type=$2
+  case $type in
+  ip | gateway | dns)
+    if [[ ! $input =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+      log "$type inválido! Use o formato xxx.xxx.xxx.xxx"
+      return 1
+    fi
+    IFS='.' read -r -a octets <<<"$input"
+    for octet in "${octets[@]}"; do
+      if [ "$octet" -gt 255 ] || [ "$octet" -lt 0 ]; then
+        log "$type inválido! Cada octeto deve estar entre 0 e 255"
+        return 1
+      fi
+    done
+    ;;
+  netmask)
+    if [[ ! $input =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+      log "Máscara de sub-rede inválida! Use o formato xxx.xxx.xxx.xxx"
+      return 1
+    fi
+    valid_masks=("0.0.0.0" "128.0.0.0" "192.0.0.0" "224.0.0.0" "240.0.0.0" "248.0.0.0"
+      "252.0.0.0" "254.0.0.0" "255.0.0.0" "255.128.0.0" "255.192.0.0"
+      "255.224.0.0" "255.240.0.0" "255.248.0.0" "255.252.0.0" "255.254.0.0"
+      "255.255.0.0" "255.255.128.0" "255.255.192.0" "255.255.224.0"
+      "255.255.240.0" "255.255.248.0" "255.255.252.0" "255.255.254.0"
+      "255.255.255.0" "255.255.255.128" "255.255.255.192" "255.255.255.224"
+      "255.255.255.240" "255.255.255.248" "255.255.255.252" "255.255.255.254"
+      "255.255.255.255")
+    if ! printf '%s\n' "${valid_masks[@]}" | grep -Fx "$input" >/dev/null; then
+      log "Máscara de sub-rede inválida! Use uma máscara válida (ex.: 255.255.255.0)"
+      return 1
+    fi
+    ;;
+  esac
+  return 0
+}
+
+# Função para configurar a rede
+configure_network() {
+  log "Iniciando configuração de rede"
+
+  INTERFACE=$(ip link | grep -E '^[0-9]+: (eth|ens|enp|eno|wlan)' | awk '{print $2}' | cut -d':' -f1 | head -n 1)
+  if [ -z "$INTERFACE" ]; then
+    log "Nenhuma interface de rede detectada"
+    exit 13
+  fi
+  log "Interface de rede detectada: $INTERFACE"
+
+  NETWORK_MANAGER=""
+  if command -v nmcli >/dev/null 2>&1 && systemctl is-active NetworkManager >/dev/null 2>&1; then
+    NETWORK_MANAGER="NetworkManager"
+  elif command -v networkctl >/dev/null 2>&1 && systemctl is-active systemd-networkd >/dev/null 2>&1; then
+    NETWORK_MANAGER="systemd-networkd"
+  elif [ -f /etc/network/interfaces ]; then
+    NETWORK_MANAGER="ifupdown"
+  else
+    log "Nenhum gerenciador de rede compatível detectado (NetworkManager, systemd-networkd, ifupdown)"
+    exit 14
+  fi
+  log "Gerenciador de rede detectado: $NETWORK_MANAGER"
+
+  while true; do
+    read -p "Informe o endereço IP fixo (ex.: 192.168.1.100): " IP_ADDRESS
+    validate_network_input "$IP_ADDRESS" ip && break
+  done
+  while true; do
+    read -p "Informe a máscara de sub-rede (ex.: 255.255.255.0): " NETMASK
+    validate_network_input "$NETMASK" netmask && break
+  done
+  while true; do
+    read -p "Informe o gateway (ex.: 192.168.1.1): " GATEWAY
+    validate_network_input "$GATEWAY" gateway && break
+  done
+  while true; do
+    read -p "Informe o DNS primário (ex.: 8.8.8.8): " DNS1
+    validate_network_input "$DNS1" dns && break
+  done
+  read -p "Informe o DNS secundário (opcional, ex.: 8.8.4.4): " DNS2
+  if [ -n "$DNS2" ]; then
+    validate_network_input "$DNS2" dns || DNS2=""
+  fi
+
+  case $NETWORK_MANAGER in
+  NetworkManager)
+    log "Configurando rede via NetworkManager"
+    nmcli con mod "$INTERFACE" ipv4.addresses "$IP_ADDRESS/$(ipcalc -p "$IP_ADDRESS" "$NETMASK" | grep PREFIX | cut -d'=' -f2)" \
+      ipv4.gateway "$GATEWAY" ipv4.dns "$DNS1${DNS2:+,$DNS2}" ipv4.method manual || {
+      log "Falha ao configurar NetworkManager"
+      exit 15
+    }
+    nmcli con up "$INTERFACE" || {
+      log "Falha ao ativar interface $INTERFACE"
+      exit 15
+    }
+    ;;
+  systemd-networkd)
+    log "Configurando rede via systemd-networkd"
+    cat >/etc/systemd/network/20-wired.network <<EOF
+[Match]
+Name=$INTERFACE
+
+[Network]
+Address=$IP_ADDRESS/$(ipcalc -p "$IP_ADDRESS" "$NETMASK" | grep PREFIX | cut -d'=' -f2)
+Gateway=$GATEWAY
+DNS=$DNS1
+${DNS2:+DNS=$DNS2}
+EOF
+    systemctl restart systemd-networkd || {
+      log "Falha ao reiniciar systemd-networkd"
+      exit 15
+    }
+    ;;
+  ifupdown)
+    log "Configurando rede via ifupdown"
+    cat >/etc/network/interfaces <<EOF
+auto lo
+iface lo inet loopback
+
+auto $INTERFACE
+iface $INTERFACE inet static
+    address $IP_ADDRESS
+    netmask $NETMASK
+    gateway $GATEWAY
+    dns-nameservers $DNS1${DNS2:+ $DNS2}
+EOF
+    ifdown "$INTERFACE" && ifup "$INTERFACE" || {
+      log "Falha ao reiniciar interface $INTERFACE"
+      exit 15
+    }
+    ;;
+  esac
+
+  log "Configuração de rede aplicada com sucesso"
 }
 
 # Função para verificar a versão mais recente do Samba
@@ -136,7 +275,7 @@ install_dependencies() {
     libncurses5-dev libpam0g-dev libparse-yapp-perl libpopt-dev libreadline-dev \
     nettle-dev perl pkg-config python3-dev python3-dnspython python3-gpg python3-markdown \
     xsltproc zlib1g-dev liblmdb-dev lmdb-utils libsystemd-dev libdbus-1-dev libtasn1-bin \
-    winbind libnss-winbind libpam-winbind || {
+    winbind libnss-winbind libpam-winbind ipcalc || {
     log "Falha ao instalar dependências"
     exit 5
   }
@@ -177,8 +316,8 @@ install_samba() {
   source /root/.bashrc
 
   cp -v /usr/src/"$DIR_UNPACK_SAMBA"/bin/default/packaging/systemd/samba.service /etc/systemd/system/samba-ad-dc.service
-  mkdir -pv /usr/local/samba/etc/sysconfig
-  echo 'SAMBAOPTIONS="-D"' >/usr/local/samba/etc/sysconfig/samba
+  mkdir -pv "$SAMBA_CONF_DIR"
+  echo 'SAMBAOPTIONS="-D"' >"$SAMBA_CONF_DIR/sysconfig/samba"
   systemctl daemon-reload
   systemctl enable samba-ad-dc.service
 }
@@ -210,6 +349,15 @@ provision_addc() {
   systemctl stop systemd-resolved.service
   systemctl disable systemd-resolved.service
 
+  # Remover smb.conf existente em /etc/samba para evitar conflitos
+  if [ -f /etc/samba/smb.conf ]; then
+    log "Removendo smb.conf existente em /etc/samba para evitar conflitos"
+    rm -f /etc/samba/smb.conf || {
+      log "Falha ao remover /etc/samba/smb.conf"
+      exit 16
+    }
+  fi
+
   log "Configurando ADDC"
   while true; do
     read -p "Informe o FQDN (Ex.: addc01.company.local): " FQDN
@@ -239,15 +387,28 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
 
   echo "$HOSTNAME" >/etc/hostname
 
-  samba-tool domain provision --use-rfc2307 --domain="$NETBIOS" --realm="$FQDN" || {
+  # Criar diretório para smb.conf se não existir
+  mkdir -p "$SAMBA_CONF_DIR/samba"
+
+  # Executar provisionamento com caminho explícito para smb.conf
+  log "Executando provisionamento do domínio"
+  samba-tool domain provision --use-rfc2307 --domain="$NETBIOS" --realm="$FQDN" \
+    --configfile="$SAMBA_CONF" --dns-backend=SAMBA_INTERNAL || {
     log "Falha no provisionamento"
     exit 9
   }
+
+  # Copiar krb5.conf gerado para /etc
   rm -f /etc/krb5.conf
-  cp -bv /usr/local/samba/var/lib/samba/private/krb5.conf /etc/krb5.conf
+  cp -v /usr/local/samba/share/setup/krb5.conf /etc/krb5.conf || {
+    log "Falha ao copiar krb5.conf"
+    exit 17
+  }
 
   FQDN=${FQDN,,}
 
+  # Gerar smb.conf com configurações adicionais
+  log "Gerando smb.conf em $SAMBA_CONF"
   echo "
 [global]
     dns forwarder = $DNS_FORWARDER
@@ -258,13 +419,13 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
     idmap_ldb:use rfc2307 = yes
 
 [netlogon]
-    path = /usr/local/samba/var/lib/samba/${FQDN}/scripts
+    path = /usr/local/samba/var/locks/sysvol/$FQDN/scripts
     read only = No
 
 [sysvol]
-    path = /usr/local/samba/var/lib/samba/sysvol
+    path = /usr/local/samba/var/locks/sysvol
     read only = No
-" >/usr/local/samba/etc/samba/smb.conf
+" >"$SAMBA_CONF"
 
   systemctl start samba-ad-dc.service || {
     log "Falha ao iniciar o serviço Samba"
@@ -278,6 +439,15 @@ provision_fileserver() {
   log "Iniciando o Provisionamento do File Server (Membro de Domínio)"
   systemctl stop systemd-resolved.service
   systemctl disable systemd-resolved.service
+
+  # Remover smb.conf existente em /etc/samba para evitar conflitos
+  if [ -f /etc/samba/smb.conf ]; then
+    log "Removendo smb.conf existente em /etc/samba para evitar conflitos"
+    rm -f /etc/samba/smb.conf || {
+      log "Falha ao remover /etc/samba/smb.conf"
+      exit 16
+    }
+  fi
 
   log "Configurando File Server"
   while true; do
@@ -350,8 +520,11 @@ group: compat winbind
 shadow: compat
 " >>/etc/nsswitch.conf
 
+  # Criar diretório para smb.conf se não existir
+  mkdir -p "$SAMBA_CONF_DIR/samba"
+
   # Configurar smb.conf
-  log "Configurando smb.conf"
+  log "Configurando smb.conf em $SAMBA_CONF"
   echo "
 [global]
     workgroup = $DOMAIN_NETBIOS
@@ -377,7 +550,7 @@ shadow: compat
     browsable = yes
     writable = yes
     valid users = @$DOMAIN_NETBIOS\\Domain\ Users
-" >/usr/local/samba/etc/samba/smb.conf
+" >"$SAMBA_CONF"
 
   # Criar diretório de compartilhamento
   log "Criando diretório de compartilhamento"
@@ -452,4 +625,5 @@ clear
 check_root
 check_os_compatibility
 show_banner
+configure_network
 show_menu
