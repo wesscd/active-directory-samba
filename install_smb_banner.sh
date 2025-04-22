@@ -2,19 +2,19 @@
 
 # Autor: Wesley Marques
 # Descrição: Instalar e configurar SAMBA4 para ADDC ou File Server (membro de domínio)
-# Versão: 0.7
+# Versão: 0.9.1
 # Licença: MIT License
 
 # Variáveis configuráveis
 DEFAULT_SAMBA_VERSION="4.14.7"
-SAMBA_VERSION="$DEFAULT_SAMBA_VERSION"
-LINK_PACK_SAMBA="https://download.samba.org/pub/samba/stable/samba-$SAMBA_VERSION.tar.gz"
-PACK_SAMBA="samba-$SAMBA_VERSION.tar.gz"
-DIR_UNPACK_SAMBA="samba-$SAMBA_VERSION"
+SAMBA_VERSION=""
+LINK_PACK_SAMBA=""
+PACK_SAMBA=""
+DIR_UNPACK_SAMBA=""
 TIMEZONE="America/Sao_Paulo"
 DNS_FORWARDER="8.8.8.8"
 LOG_FILE="/var/log/samba-install.log"
-SCRIPT_VERSION="0.7"
+SCRIPT_VERSION="0.9.1"
 SAMBA_CONF_DIR="/usr/local/samba/etc"
 SAMBA_CONF="$SAMBA_CONF_DIR/samba/smb.conf"
 
@@ -56,7 +56,7 @@ show_banner() {
     ""
     ""
     "████████╗███████╗ ██████╗██╗  ██╗    ██████╗ ███████╗███╗   ███╗ ██████╗ ████████╗███████╗"
-    "╚══██╔══╝██╔════╝██╔════╝██║  ██║    ██╔══██╗██╔════╝████╗ ████║██╔═══██╗╚══██╔══╝██╔====╝"
+    "╚══██╔══╝██╔════╝██╔════╝██║  ██║    ██╔══██╗██╔════╝████╗ ████║██╔═══██╗╚══██╔══╝██╔════╝"
     "   ██║   █████╗  ██║     ███████║    ██████╔╝████X╗  ██╔████╔██║██║   ██║   ██║   █████╗  "
     "   ██║   ██╔══╝  ██║     ██╔══██║    ██╔══██╗██╔══╝  ██║╚██╔╝██║██║   ██║   ██║   ██╔══╝  "
     "   ██║   ███████╗╚██████╗██║  ██║    ██║  ██║███████╗██║ ╚═╝ ██║╚██████╔╝   ██║   ███████╗"
@@ -219,23 +219,40 @@ EOF
   log "Configuração de rede aplicada com sucesso"
 }
 
-# Função para verificar a versão mais recente do Samba
-check_samba_version() {
-  log "Verificando a versão mais recente do Samba..."
-  LATEST_VERSION=$(curl -s https://www.samba.org/samba/ftp/stable/ | grep -oP 'samba-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 1)
-  if [ -z "$LATEST_VERSION" ]; then
-    log "Não foi possível verificar a versão mais recente. Usando $SAMBA_VERSION."
-    return
-  fi
-  log "Versão mais recente disponível: $LATEST_VERSION"
-  read -p "Deseja usar a versão mais recente ($LATEST_VERSION) em vez de $SAMBA_VERSION? (s/n): " USE_LATEST
-  if [[ "$USE_LATEST" =~ ^[Ss]$ ]]; then
-    SAMBA_VERSION="$LATEST_VERSION"
+# Função para perguntar a versão do Samba e validar no FTP
+ask_samba_version() {
+  log "Solicitando versão do Samba para instalação"
+  while true; do
+    read -p "Digite a versão do Samba que deseja instalar (ex.: 4.18.1, padrão: $DEFAULT_SAMBA_VERSION): " INPUT_VERSION
+    SAMBA_VERSION=${INPUT_VERSION:-$DEFAULT_SAMBA_VERSION}
+    # Validar formato da versão (X.Y.Z)
+    if [[ ! "$SAMBA_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      log "Versão inválida! Use o formato X.Y.Z (ex.: 4.18.1)"
+      continue
+    fi
+
+    # Construir a URL para verificar
     LINK_PACK_SAMBA="https://download.samba.org/pub/samba/stable/samba-$SAMBA_VERSION.tar.gz"
     PACK_SAMBA="samba-$SAMBA_VERSION.tar.gz"
     DIR_UNPACK_SAMBA="samba-$SAMBA_VERSION"
-    log "Versão atualizada para $SAMBA_VERSION"
-  fi
+
+    # Verificar se o arquivo existe no FTP
+    if curl --output /dev/null --silent --head --fail "$LINK_PACK_SAMBA"; then
+      log "Versão $SAMBA_VERSION encontrada no FTP. Prosseguindo..."
+      break
+    else
+      log "A versão $SAMBA_VERSION não foi encontrada no FTP (https://download.samba.org/pub/samba/stable/)."
+      # Listar algumas versões disponíveis como sugestão
+      AVAILABLE_VERSIONS=$(curl -s https://download.samba.org/pub/samba/stable/ | grep -oP 'samba-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 5)
+      if [ -n "$AVAILABLE_VERSIONS" ]; then
+        log "Versões disponíveis (últimas 5):"
+        echo "$AVAILABLE_VERSIONS" | while read -r version; do
+          log "  - $version"
+        done
+      fi
+      log "Por favor, digite uma versão válida."
+    fi
+  done
 }
 
 # Função para atualizar o sistema
@@ -314,6 +331,18 @@ install_samba() {
   log "Configurando SAMBA 03/03 - path"
   echo "PATH=$PATH:/usr/local/samba/bin:/usr/local/samba/sbin" >>/root/.bashrc
   source /root/.bashrc
+
+  # Garantir que os arquivos de esquema estejam presentes
+  log "Verificando arquivos de esquema"
+  SCHEMA_DIR="/usr/local/samba/share/setup/ad-schema"
+  if [ ! -d "$SCHEMA_DIR" ] || [ ! -f "$SCHEMA_DIR/Windows Server 2012 R2.ldf" ]; then
+    log "Arquivos de esquema ausentes. Tentando copiar do diretório de origem..."
+    mkdir -p "$SCHEMA_DIR"
+    cp -rv /usr/src/"$DIR_UNPACK_SAMBA"/source4/setup/ad-schema/* "$SCHEMA_DIR" || {
+      log "Falha ao copiar arquivos de esquema"
+      exit 19
+    }
+  fi
 
   cp -v /usr/src/"$DIR_UNPACK_SAMBA"/bin/default/packaging/systemd/samba.service /etc/systemd/system/samba-ad-dc.service
   mkdir -pv "$SAMBA_CONF_DIR"
@@ -511,7 +540,7 @@ provision_fileserver() {
     exit 8
   fi
 
-  # Configurar /etc/hosts
+  # configurar /etc/hosts
   echo "
 127.0.0.1 localhost
 $IP $HOSTNAME" >/etc/hosts
@@ -629,7 +658,7 @@ show_menu() {
   read -p "Escolha uma opção (1-3): " choice
   case $choice in
   1)
-    check_samba_version
+    ask_samba_version
     update_system
     adjust_datetime
     install_dependencies
@@ -637,7 +666,7 @@ show_menu() {
     provision_addc
     ;;
   2)
-    check_samba_version
+    ask_samba_version
     update_system
     adjust_datetime
     install_dependencies
