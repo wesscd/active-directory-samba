@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # Autor: Wesley Marques
-# Descrição: Instalar e configurar SAMBA4 para ADDC ou File Server (membro de domínio)
-# Versão: 0.8
+# Descrição: Instalar e configurar SAMBA4 para ADDC ou File Server (membro de domínio) usando APT
+# Versão: 0.8.1
 # Licença: MIT License
 
 # Variáveis configuráveis
 TIMEZONE="America/Sao_Paulo"
 DNS_FORWARDER="8.8.8.8"
 LOG_FILE="/var/log/samba-install.log"
-SCRIPT_VERSION="0.8"
+SCRIPT_VERSION="0.8.1"
 SAMBA_CONF="/etc/samba/smb.conf"
 
 # Função para registrar logs
@@ -240,22 +240,21 @@ adjust_datetime() {
   service ntp start
 }
 
-# Função para instalar dependências e o Samba
+# Função para instalar o Samba via APT
 install_samba() {
-  log "Instalando dependências e o Samba via APT"
-  apt-get install -y samba samba-common samba-libs samba-vfs-modules winbind \
-    acl attr krb5-user libpam-winbind libnss-winbind ipcalc || {
-    log "Falha ao instalar o Samba e dependências"
+  log "Instalando SAMBA4 via APT"
+  apt install -y samba samba-common samba-libs samba-vfs-modules winbind libnss-winbind libpam-winbind \
+    krb5-user krb5-config || {
+    log "Falha ao instalar o Samba via APT"
     exit 5
   }
-
-  # Parar serviços para evitar conflitos durante a configuração
-  systemctl stop smbd nmbd winbind || log "Falha ao parar serviços do Samba"
-  systemctl disable smbd nmbd winbind || log "Falha ao desativar serviços do Samba"
 
   apt-get -y autoremove
   apt-get -y autoclean
   apt-get -y clean
+
+  systemctl stop samba-ad-dc smbd nmbd winbind
+  systemctl enable samba-ad-dc
 }
 
 # Função para validar entradas do usuário
@@ -263,15 +262,31 @@ validate_input() {
   local input=$1
   local type=$2
   case $type in
-  fqdn)
+  domain)
     if [[ ! $input =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-      log "FQDN inválido!"
+      log "Domínio inválido! Use o formato dominio.local"
       return 1
     fi
     ;;
-  netbios | hostname | username)
+  netbios)
+    if [[ ! $input =~ ^[a-zA-Z][a-zA-Z-]*$ ]]; then
+      log "NetBIOS inválido! Use apenas letras e hífens, sem números."
+      return 1
+    fi
+    if [ ${#input} -gt 15 ]; then
+      log "NetBIOS inválido! Deve ter no máximo 15 caracteres."
+      return 1
+    fi
+    ;;
+  hostname)
     if [[ ! $input =~ ^[a-zA-Z0-9-]+$ ]]; then
-      log "$type inválido! Use apenas letras, números e hífens."
+      log "Hostname inválido! Use apenas letras, números e hífens."
+      return 1
+    fi
+    ;;
+  username)
+    if [[ ! $input =~ ^[a-zA-Z0-9-]+$ ]]; then
+      log "Usuário inválido! Use apenas letras, números e hífens."
       return 1
     fi
     ;;
@@ -296,15 +311,18 @@ provision_addc() {
 
   log "Configurando ADDC"
   while true; do
-    read -p "Informe o FQDN (Ex.: addc01.company.local): " FQDN
-    validate_input "$FQDN" fqdn && break
+    read -p "Informe o domínio (ex.: laboratorio.local): " DOMAIN
+    validate_input "$DOMAIN" domain && break
   done
   while true; do
-    read -p "Informe o NetBIOS (Ex.: addc01): " NETBIOS
+    read -p "Informe o NetBIOS do domínio (ex.: addc, apenas letras e hífens, sem números, máx. 15 caracteres): " NETBIOS
     validate_input "$NETBIOS" netbios && break
   done
+  # Construir o FQDN como NETBIOS.DOMAIN
+  FQDN="${NETBIOS}.${DOMAIN}"
+  log "FQDN gerado: $FQDN"
   while true; do
-    read -p "Informe o hostname (Ex.: serveraddc): " HOSTNAME
+    read -p "Informe o hostname (ex.: serveraddc, pode conter números): " HOSTNAME
     validate_input "$HOSTNAME" hostname && break
   done
   read -p "Digite o DNS forwarder (padrão: $DNS_FORWARDER): " INPUT_DNS
@@ -333,7 +351,7 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
 
   # Copiar krb5.conf gerado para /etc
   rm -f /etc/krb5.conf
-  cp -v /var/lib/samba/private/krb5.conf /etc/krb5.conf || {
+  cp -v /usr/share/samba/setup/krb5.conf /etc/krb5.conf || {
     log "Falha ao copiar krb5.conf"
     exit 17
   }
@@ -360,13 +378,12 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
     read only = No
 EOF
 
-  # Ajustar permissões do smb.conf
+  # Ajustar permissões do diretório
   chown root:root "$SAMBA_CONF"
   chmod 644 "$SAMBA_CONF"
 
-  systemctl enable smbd nmbd
-  systemctl start smbd nmbd || {
-    log "Falha ao iniciar os serviços Samba"
+  systemctl start samba-ad-dc.service || {
+    log "Falha ao iniciar o serviço Samba"
     exit 10
   }
   log "Serviço SAMBA (ADDC) instalado com sucesso."
@@ -389,21 +406,21 @@ provision_fileserver() {
 
   log "Configurando File Server"
   while true; do
-    read -p "Informe o hostname (Ex.: fileserver): " HOSTNAME
+    read -p "Informe o hostname (ex.: fileserver, pode conter números): " HOSTNAME
     validate_input "$HOSTNAME" hostname && break
   done
   while true; do
-    read -p "Informe o FQDN do domínio (Ex.: company.local): " DOMAIN_FQDN
-    validate_input "$DOMAIN_FQDN" fqdn && break
+    read -p "Informe o FQDN do domínio (ex.: company.local): " DOMAIN_FQDN
+    validate_input "$DOMAIN_FQDN" domain && break
   done
   while true; do
-    read -p "Informe o NetBIOS do domínio (Ex.: COMPANY): " DOMAIN_NETBIOS
+    read -p "Informe o NetBIOS do domínio (ex.: COMPANY, apenas letras e hífens, sem números, máx. 15 caracteres): " DOMAIN_NETBIOS
     validate_input "$DOMAIN_NETBIOS" netbios && break
   done
   read -p "Digite o DNS forwarder (padrão: $DNS_FORWARDER): " INPUT_DNS
   DNS_FORWARDER=${INPUT_DNS:-$DNS_FORWARDER}
   while true; do
-    read -p "Informe o usuário administrador do domínio (Ex.: Administrator): " ADMIN_USER
+    read -p "Informe o usuário administrador do domínio (ex.: Administrator): " ADMIN_USER
     validate_input "$ADMIN_USER" username && break
   done
   read -s -p "Informe a senha do administrador: " ADMIN_PASS
@@ -506,9 +523,12 @@ shadow: compat
 
   # Iniciar serviços
   log "Iniciando serviços"
-  systemctl enable smbd nmbd winbind
-  systemctl start smbd nmbd winbind || {
-    log "Falha ao iniciar os serviços Samba"
+  systemctl start samba-ad-dc.service || {
+    log "Falha ao iniciar o serviço Samba"
+    exit 10
+  }
+  systemctl start winbind.service || {
+    log "Falha ao iniciar o serviço Winbind"
     exit 10
   }
 
