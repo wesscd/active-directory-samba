@@ -1,22 +1,16 @@
 #!/bin/bash
 
 # Autor: Wesley Marques
-# Descrição: Instalar e configurar SAMBA4 para ADDC ou File Server (membro de domínio)
-# Versão: 0.9.2
+# Descrição: Instalar e configurar SAMBA4 para ADDC ou File Server (membro de domínio) usando APT
+# Versão: 1.0
 # Licença: MIT License
 
 # Variáveis configuráveis
-DEFAULT_SAMBA_VERSION="4.14.7"
-SAMBA_VERSION=""
-LINK_PACK_SAMBA=""
-PACK_SAMBA=""
-DIR_UNPACK_SAMBA=""
 TIMEZONE="America/Sao_Paulo"
 DNS_FORWARDER="8.8.8.8"
 LOG_FILE="/var/log/samba-install.log"
-SCRIPT_VERSION="0.9.2"
-SAMBA_CONF_DIR="/usr/local/samba/etc"
-SAMBA_CONF="$SAMBA_CONF_DIR/samba/smb.conf"
+SCRIPT_VERSION="1.0"
+SAMBA_CONF="/etc/samba/smb.conf"
 
 # Função para registrar logs
 log() {
@@ -219,42 +213,6 @@ EOF
   log "Configuração de rede aplicada com sucesso"
 }
 
-# Função para perguntar a versão do Samba e validar no FTP
-ask_samba_version() {
-  log "Solicitando versão do Samba para instalação"
-  while true; do
-    read -p "Digite a versão do Samba que deseja instalar (ex.: 4.18.1, padrão: $DEFAULT_SAMBA_VERSION): " INPUT_VERSION
-    SAMBA_VERSION=${INPUT_VERSION:-$DEFAULT_SAMBA_VERSION}
-    # Validar formato da versão (X.Y.Z)
-    if [[ ! "$SAMBA_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      log "Versão inválida! Use o formato X.Y.Z (ex.: 4.18.1)"
-      continue
-    fi
-
-    # Construir a URL para verificar
-    LINK_PACK_SAMBA="https://download.samba.org/pub/samba/stable/samba-$SAMBA_VERSION.tar.gz"
-    PACK_SAMBA="samba-$SAMBA_VERSION.tar.gz"
-    DIR_UNPACK_SAMBA="samba-$SAMBA_VERSION"
-
-    # Verificar se o arquivo existe no FTP
-    if curl --output /dev/null --silent --head --fail "$LINK_PACK_SAMBA"; then
-      log "Versão $SAMBA_VERSION encontrada no FTP. Prosseguindo..."
-      break
-    else
-      log "A versão $SAMBA_VERSION não foi encontrada no FTP (https://download.samba.org/pub/samba/stable/)."
-      # Listar algumas versões disponíveis como sugestão
-      AVAILABLE_VERSIONS=$(curl -s https://download.samba.org/pub/samba/stable/ | grep -oP 'samba-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 5)
-      if [ -n "$AVAILABLE_VERSIONS" ]; then
-        log "Versões disponíveis (últimas 5):"
-        echo "$AVAILABLE_VERSIONS" | while read -r version; do
-          log "  - $version"
-        done
-      fi
-      log "Por favor, digite uma versão válida."
-    fi
-  done
-}
-
 # Função para atualizar o sistema
 update_system() {
   log "Atualizando repositórios"
@@ -282,73 +240,21 @@ adjust_datetime() {
   service ntp start
 }
 
-# Função para instalar dependências
-install_dependencies() {
-  log "Instalando dependências"
-  apt-get install -y wget acl attr autoconf bind9utils bison build-essential \
-    debhelper dnsutils docbook-xml docbook-xsl flex gdb libjansson-dev krb5-user \
-    libacl1-dev libaio-dev libarchive-dev libattr1-dev libblkid-dev libbsd-dev \
-    libcap-dev libcups2-dev libgnutls28-dev libgpgme-dev libjson-perl libldap2-dev \
-    libncurses5-dev libpam0g-dev libparse-yapp-perl libpopt-dev libreadline-dev \
-    nettle-dev perl pkg-config python3-dev python3-dnspython python3-gpg python3-markdown \
-    xsltproc zlib1g-dev liblmdb-dev lmdb-utils libsystemd-dev libdbus-1-dev libtasn1-bin \
-    winbind libnss-winbind libpam-winbind ipcalc || {
-    log "Falha ao instalar dependências"
+# Função para instalar o Samba via APT
+install_samba() {
+  log "Instalando SAMBA4 via APT"
+  apt install -y samba samba-common samba-libs samba-vfs-modules winbind libnss-winbind libpam-winbind \
+    krb5-user krb5-config || {
+    log "Falha ao instalar o Samba via APT"
     exit 5
   }
 
   apt-get -y autoremove
   apt-get -y autoclean
   apt-get -y clean
-}
 
-# Função para preparar e instalar o Samba
-install_samba() {
-  log "Preparando SAMBA4"
-  cd /usr/src/
-  wget -c "$LINK_PACK_SAMBA" || {
-    log "Falha ao baixar o Samba"
-    exit 6
-  }
-  tar -xf "$PACK_SAMBA" || {
-    log "Falha ao extrair o Samba"
-    exit 6
-  }
-  cd "$DIR_UNPACK_SAMBA"
-
-  log "Configurando SAMBA 01/03 - systemd fhs"
-  ./configure --with-systemd --prefix=/usr/local/samba --enable-fhs || {
-    log "Falha na configuração"
-    exit 7
-  }
-
-  log "Configurando SAMBA 02/03 - make install"
-  make && make install || {
-    log "Falha na compilação/instalação"
-    exit 7
-  }
-
-  log "Configurando SAMBA 03/03 - path"
-  echo "PATH=$PATH:/usr/local/samba/bin:/usr/local/samba/sbin" >>/root/.bashrc
-  source /root/.bashrc
-
-  # Garantir que os arquivos de esquema estejam presentes
-  log "Verificando arquivos de esquema"
-  SCHEMA_DIR="/usr/local/samba/share/setup/ad-schema"
-  if [ ! -d "$SCHEMA_DIR" ] || [ ! -f "$SCHEMA_DIR/Windows Server 2012 R2.ldf" ]; then
-    log "Arquivos de esquema ausentes. Tentando copiar do diretório de origem..."
-    mkdir -p "$SCHEMA_DIR"
-    cp -rv /usr/src/"$DIR_UNPACK_SAMBA"/source4/setup/ad-schema/* "$SCHEMA_DIR" || {
-      log "Falha ao copiar arquivos de esquema"
-      exit 19
-    }
-  fi
-
-  cp -v /usr/src/"$DIR_UNPACK_SAMBA"/bin/default/packaging/systemd/samba.service /etc/systemd/system/samba-ad-dc.service
-  mkdir -pv "$SAMBA_CONF_DIR"
-  echo 'SAMBAOPTIONS="-D"' >"$SAMBA_CONF_DIR/sysconfig/samba"
-  systemctl daemon-reload
-  systemctl enable samba-ad-dc.service
+  systemctl stop samba-ad-dc smbd nmbd winbind
+  systemctl enable samba-ad-dc
 }
 
 # Função para validar entradas do usuário
@@ -394,16 +300,7 @@ provision_addc() {
   systemctl stop systemd-resolved.service
   systemctl disable systemd-resolved.service
 
-  # Remover smb.conf existente em /etc/samba para evitar conflitos
-  if [ -f /etc/samba/smb.conf ]; then
-    log "Removendo smb.conf existente em /etc/samba para evitar conflitos"
-    rm -f /etc/samba/smb.conf || {
-      log "Falha ao remover /etc/samba/smb.conf"
-      exit 16
-    }
-  fi
-
-  # Remover smb.conf no destino, se existir
+  # Remover smb.conf existente para evitar conflitos
   if [ -f "$SAMBA_CONF" ]; then
     log "Removendo smb.conf existente em $SAMBA_CONF para evitar conflitos"
     rm -f "$SAMBA_CONF" || {
@@ -444,7 +341,7 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
 
   echo "$HOSTNAME" >/etc/hostname
 
-  # Executar provisionamento sem especificar --configfile
+  # Executar provisionamento
   log "Executando provisionamento do domínio"
   samba-tool domain provision --use-rfc2307 --domain="$NETBIOS" --realm="$FQDN" \
     --dns-backend=SAMBA_INTERNAL || {
@@ -452,23 +349,9 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
     exit 9
   }
 
-  # Mover smb.conf gerado para o local desejado
-  GENERATED_CONF="/usr/local/samba/etc/smb.conf"
-  if [ -f "$GENERATED_CONF" ]; then
-    log "Movendo smb.conf gerado para $SAMBA_CONF"
-    mkdir -p "$SAMBA_CONF_DIR/samba"
-    mv "$GENERATED_CONF" "$SAMBA_CONF" || {
-      log "Falha ao mover smb.conf para $SAMBA_CONF"
-      exit 18
-    }
-  else
-    log "Arquivo smb.conf não foi gerado pelo provisionamento"
-    exit 18
-  fi
-
   # Copiar krb5.conf gerado para /etc
   rm -f /etc/krb5.conf
-  cp -v /usr/local/samba/share/setup/krb5.conf /etc/krb5.conf || {
+  cp -v /usr/share/samba/setup/krb5.conf /etc/krb5.conf || {
     log "Falha ao copiar krb5.conf"
     exit 17
   }
@@ -487,11 +370,11 @@ $IP $FQDN $HOSTNAME" >/etc/hosts
     idmap_ldb:use rfc2307 = yes
 
 [netlogon]
-    path = /usr/local/samba/var/locks/sysvol/$FQDN/scripts
+    path = /var/lib/samba/sysvol/$FQDN/scripts
     read only = No
 
 [sysvol]
-    path = /usr/local/samba/var/locks/sysvol
+    path = /var/lib/samba/sysvol
     read only = No
 EOF
 
@@ -512,16 +395,7 @@ provision_fileserver() {
   systemctl stop systemd-resolved.service
   systemctl disable systemd-resolved.service
 
-  # Remover smb.conf existente em /etc/samba para evitar conflitos
-  if [ -f /etc/samba/smb.conf ]; then
-    log "Removendo smb.conf existente em /etc/samba para evitar conflitos"
-    rm -f /etc/samba/smb.conf || {
-      log "Falha ao remover /etc/samba/smb.conf"
-      exit 16
-    }
-  fi
-
-  # Remover smb.conf no destino, se existir
+  # Remover smb.conf existente para evitar conflitos
   if [ -f "$SAMBA_CONF" ]; then
     log "Removendo smb.conf existente em $SAMBA_CONF para evitar conflitos"
     rm -f "$SAMBA_CONF" || {
@@ -601,9 +475,6 @@ group: compat winbind
 shadow: compat
 " >>/etc/nsswitch.conf
 
-  # Criar diretório para smb.conf
-  mkdir -p "$SAMBA_CONF_DIR/samba"
-
   # Configurar smb.conf
   log "Configurando smb.conf em $SAMBA_CONF"
   echo "
@@ -677,18 +548,14 @@ show_menu() {
   read -p "Escolha uma opção (1-3): " choice
   case $choice in
   1)
-    ask_samba_version
     update_system
     adjust_datetime
-    install_dependencies
     install_samba
     provision_addc
     ;;
   2)
-    ask_samba_version
     update_system
     adjust_datetime
-    install_dependencies
     install_samba
     provision_fileserver
     ;;
