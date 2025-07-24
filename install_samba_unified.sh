@@ -5,6 +5,13 @@
 # Versão: 1.0
 # Licença: MIT License
 
+# Cores para a saída
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
 # Variáveis configuráveis
 TIMEZONE="America/Sao_Paulo"
 DNS_FORWARDER="8.8.8.8"
@@ -12,15 +19,36 @@ LOG_FILE="/var/log/samba-install.log"
 SCRIPT_VERSION="1.0"
 SAMBA_CONF="/etc/samba/smb.conf"
 
-# Função para registrar logs
+# Função para registrar logs com cores
 log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+  local message=$1
+  local level=${2:-INFO}
+  local color=$NC
+
+  case $level in
+    SUCCESS) color=$GREEN ;;
+    WARN) color=$YELLOW ;;
+    ERROR) color=$RED ;;
+    INFO) color=$CYAN ;;
+  esac
+
+  echo -e "${color}[$(date '+%Y-%m-%d %H:%M:%S')] [$level] ${message}${NC}" | tee -a "$LOG_FILE"
+}
+
+# Função para criar backup de um arquivo
+backup_file() {
+  local file=$1
+  if [ -f "$file" ]; then
+    local backup_file="${file}.backup_$(date +%F-%T)"
+    log "Criando backup de $file em $backup_file"
+    cp "$file" "$backup_file" || log "AVISO: Falha ao criar backup de $file"
+  fi
 }
 
 # Função para verificar se o usuário tem permissões de root
 check_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    log "Você precisa de privilégios de administrador"
+    log "Você precisa de privilégios de administrador" "ERROR"
     exit 1
   fi
 }
@@ -28,13 +56,14 @@ check_root() {
 # Função para verificar a compatibilidade do sistema operacional
 check_os_compatibility() {
   if ! command -v apt >/dev/null 2>&1; then
-    log "Seu sistema operacional não é compatível com este script"
+    log "Seu sistema operacional não é compatível com este script (requer APT)" "ERROR"
     exit 2
   fi
   if ! lsb_release -a 2>/dev/null | grep -q "Ubuntu\|Debian"; then
-    log "Este script foi projetado para Ubuntu/Debian"
+    log "Este script foi projetado para Ubuntu/Debian" "ERROR"
     exit 2
   fi
+  log "Sistema operacional compatível." "SUCCESS"
 }
 
 # Função para exibir o banner
@@ -160,6 +189,16 @@ configure_network() {
     validate_network_input "$DNS2" dns || DNS2=""
   fi
 
+  # Fazer backup do arquivo de configuração de rede antes de modificar
+  case $NETWORK_MANAGER in
+  systemd-networkd)
+    backup_file "/etc/systemd/network/20-wired.network"
+    ;;
+  ifupdown)
+    backup_file "/etc/network/interfaces"
+    ;;
+  esac
+
   case $NETWORK_MANAGER in
   NetworkManager)
     log "Configurando rede via NetworkManager"
@@ -210,42 +249,44 @@ EOF
     ;;
   esac
 
-  log "Configuração de rede aplicada com sucesso"
+  log "Configuração de rede aplicada com sucesso" "SUCCESS"
 }
 
 # Função para atualizar o sistema
 update_system() {
-  log "Atualizando repositórios"
+  log "Atualizando repositórios..."
   apt update && apt upgrade -y || {
-    log "Falha na atualização do sistema"
+    log "Falha na atualização do sistema" "ERROR"
     exit 3
   }
+  log "Sistema atualizado com sucesso." "SUCCESS"
 }
 
 # Função para ajustar data e hora
 adjust_datetime() {
-  log "Ajustando data e hora"
+  log "Ajustando data e hora..."
   read -p "Digite o fuso horário (padrão: $TIMEZONE): " INPUT_TIMEZONE
   TIMEZONE=${INPUT_TIMEZONE:-$TIMEZONE}
   timedatectl set-timezone "$TIMEZONE"
   apt install ntp ntpdate -y || {
-    log "Falha ao instalar NTP"
+    log "Falha ao instalar NTP" "ERROR"
     exit 4
   }
   service ntp stop
   ntpdate pool.ntp.org || {
-    log "Falha ao sincronizar hora"
+    log "Falha ao sincronizar hora" "ERROR"
     exit 4
   }
   service ntp start
+  log "Data e hora ajustados com sucesso." "SUCCESS"
 }
 
 # Função para instalar o Samba via APT
 install_samba() {
-  log "Instalando SAMBA4 via APT"
+  log "Instalando SAMBA4 via APT..."
   apt install -y samba samba-common samba-libs samba-vfs-modules winbind libnss-winbind libpam-winbind \
     krb5-user krb5-config || {
-    log "Falha ao instalar o Samba via APT"
+    log "Falha ao instalar o Samba via APT" "ERROR"
     exit 5
   }
 
@@ -253,8 +294,10 @@ install_samba() {
   apt-get -y autoclean
   apt-get -y clean
 
+  log "Parando serviços do Samba para provisionamento..."
   systemctl stop samba-ad-dc smbd nmbd winbind
   systemctl enable samba-ad-dc
+  log "Samba instalado e serviços preparados." "SUCCESS"
 }
 
 # Função para validar entradas do usuário
@@ -300,9 +343,9 @@ provision_addc() {
   systemctl stop systemd-resolved.service
   systemctl disable systemd-resolved.service
 
-  # Remover smb.conf existente para evitar conflitos
+  # Fazer backup e remover smb.conf existente para evitar conflitos
+  backup_file "$SAMBA_CONF"
   if [ -f "$SAMBA_CONF" ]; then
-    log "Removendo smb.conf existente em $SAMBA_CONF para evitar conflitos"
     rm -f "$SAMBA_CONF" || {
       log "Falha ao remover $SAMBA_CONF"
       exit 16
@@ -386,7 +429,9 @@ EOF
     log "Falha ao iniciar o serviço Samba"
     exit 10
   }
-  log "Serviço SAMBA (ADDC) instalado com sucesso."
+  log "Serviço SAMBA (ADDC) instalado com sucesso." "SUCCESS"
+
+  run_post_install_checks
 }
 
 # Função para provisionar o File Server como membro de domínio
@@ -395,9 +440,9 @@ provision_fileserver() {
   systemctl stop systemd-resolved.service
   systemctl disable systemd-resolved.service
 
-  # Remover smb.conf existente para evitar conflitos
+  # Fazer backup e remover smb.conf existente para evitar conflitos
+  backup_file "$SAMBA_CONF"
   if [ -f "$SAMBA_CONF" ]; then
-    log "Removendo smb.conf existente em $SAMBA_CONF para evitar conflitos"
     rm -f "$SAMBA_CONF" || {
       log "Falha ao remover $SAMBA_CONF"
       exit 16
@@ -496,30 +541,49 @@ shadow: compat
     template shell = /bin/bash
     template homedir = /home/%U
 
-[share]
-    path = /srv/samba/share
-    read only = no
-    browsable = yes
-    writable = yes
-    valid users = @$DOMAIN_NETBIOS\\Domain\ Users
 " >"$SAMBA_CONF"
 
   # Ajustar permissões do smb.conf
   chown root:root "$SAMBA_CONF"
   chmod 644 "$SAMBA_CONF"
 
-  # Criar diretório de compartilhamento
-  log "Criando diretório de compartilhamento"
-  mkdir -p /srv/samba/share
-  chown ":$DOMAIN_NETBIOS\\Domain Users" /srv/samba/share
-  chmod 770 /srv/samba/share
+  # Lógica para criar compartilhamentos interativamente
+  declare -A read_only_map=( [s]=yes [S]=yes [n]=no [N]=no )
+  while true; do
+    read -p "Deseja adicionar um compartilhamento? (s/n): " add_share
+    if [[ ! "$add_share" =~ ^[Ss]$ ]]; then
+      break
+    fi
 
-  # Ingressar no domínio
-  log "Ingressando no domínio"
-  net ads join -U "$ADMIN_USER%$ADMIN_PASS" || {
-    log "Falha ao ingressar no domínio"
+    read -p "Informe o nome do compartilhamento (ex: Documentos): " share_name
+    read -p "Informe o caminho para o diretório do compartilhamento (ex: /srv/samba/docs): " share_path
+    read -p "O compartilhamento será somente leitura? (s/n): " read_only
+
+    # Criar o diretório
+    mkdir -p "$share_path"
+    log "Diretório $share_path criado."
+
+    # Adicionar o compartilhamento ao smb.conf
+    echo "
+[$share_name]
+    path = $share_path
+    read only = ${read_only_map[$read_only]}
+    browsable = yes
+" >>"$SAMBA_CONF"
+
+    # Definir permissões
+    chown -R "root:Domain Admins" "$share_path"
+    chmod -R 770 "$share_path"
+    log "Permissões definidas para $share_path."
+  done
+
+  # Ingressar no domínio de forma segura
+  log "Ingressando no domínio..."
+  echo "$ADMIN_PASS" | net ads join -U "$ADMIN_USER" - || {
+    log "Falha ao ingressar no domínio. Verifique as credenciais e a conectividade." "ERROR"
     exit 12
   }
+  log "Ingresso no domínio realizado com sucesso." "SUCCESS"
 
   # Iniciar serviços
   log "Iniciando serviços"
@@ -532,7 +596,9 @@ shadow: compat
     exit 10
   }
 
-  log "Serviço SAMBA (File Server - Membro de Domínio) instalado com sucesso."
+  log "Serviço SAMBA (File Server - Membro de Domínio) instalado com sucesso." "SUCCESS"
+
+  run_post_install_checks
 }
 
 # Função para exibir o menu
@@ -571,6 +637,64 @@ show_menu() {
   esac
 }
 
+# Função para configurar o firewall
+configure_firewall() {
+  log "Verificando o status do firewall..."
+
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    log "UFW detectado e ativo."
+    read -p "Deseja configurar as regras do UFW para o Samba? (s/n): " config_ufw
+    if [[ "$config_ufw" =~ ^[Ss]$ ]]; then
+      log "Configurando UFW..."
+      ufw allow Samba || log "AVISO: Falha ao adicionar regra 'Samba' ao UFW."
+      ufw reload || log "AVISO: Falha ao recarregar o UFW."
+      log "UFW configurado."
+    fi
+  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+    log "Firewalld detectado e ativo."
+    read -p "Deseja configurar as regras do Firewalld para o Samba? (s/n): " config_firewalld
+    if [[ "$config_firewalld" =~ ^[Ss]$ ]]; then
+      log "Configurando Firewalld..."
+      firewall-cmd --permanent --add-service=samba || log "AVISO: Falha ao adicionar serviço 'samba' ao Firewalld."
+      firewall-cmd --reload || log "AVISO: Falha ao recarregar o Firewalld."
+      log "Firewalld configurado."
+    fi
+  else
+    log "Nenhum firewall (UFW ou Firewalld) ativo detectado. Pulando a configuração do firewall."
+  fi
+}
+
+# Função para verificação pós-instalação
+run_post_install_checks() {
+  log "Executando verificações pós-instalação..."
+
+  log "Verificando o status do serviço Samba..."
+  systemctl is-active samba-ad-dc.service >/dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    log "O serviço samba-ad-dc está ativo." "SUCCESS"
+  else
+    log "O serviço samba-ad-dc não está ativo." "ERROR"
+  fi
+
+  log "Verificando a listagem de compartilhamentos..."
+  smbclient -L localhost -U% >/dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    log "Os compartilhamentos estão listáveis." "SUCCESS"
+  else
+    log "Não foi possível listar os compartilhamentos." "WARN"
+  fi
+
+  log "Verificando a resolução de DNS para o hostname..."
+  host -t A "$(hostname -f)" >/dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    log "A resolução de DNS para o hostname está funcionando." "SUCCESS"
+  else
+    log "A resolução de DNS para o hostname não está funcionando." "WARN"
+  fi
+
+  log "Verificação pós-instalação concluída." "SUCCESS"
+}
+
 # Execução principal
 exec > >(tee -a "$LOG_FILE") 2>&1
 clear
@@ -578,4 +702,5 @@ check_root
 check_os_compatibility
 show_banner
 configure_network
+configure_firewall
 show_menu
